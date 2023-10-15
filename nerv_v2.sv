@@ -24,6 +24,7 @@ module nerv #(
 	input clock,
 	input reset,
 	output trap,
+    output logic [31:0] x10,
 
 	// we have 2 external memories
 	// one is instruction memory
@@ -83,12 +84,18 @@ module nerv #(
 	assign imem_addr = (trap || mem_rd_enable_q) ? imem_addr_q : npc;
 	assign insn = imem_data;
 
-    logic [31:0] pipe_insn;
-    logic [31:0] pipe_pc;
-
 	// rs1 and rs2 are source for the instruction
 	wire [31:0] rs1_value = !insn_rs1 ? 0 : regfile[insn_rs1];
 	wire [31:0] rs2_value = !insn_rs2 ? 0 : regfile[insn_rs2];
+
+	// pipeline registers for IF and ID stage
+	logic [31:0] p_insn;
+	logic [31:0] p_pc;
+
+	// pipeline hazard control
+	logic branch_taken;
+	logic jump_taken;
+	logic detect_branch;
 
 	// components of the instruction
 	wire [6:0] insn_funct7;
@@ -99,12 +106,12 @@ module nerv #(
 	wire [6:0] insn_opcode;
 
 	// split R-type instruction - see section 2.2 of RiscV spec
-	assign {insn_funct7, insn_rs2, insn_rs1, insn_funct3, insn_rd, insn_opcode} = pipe_insn;
+	assign {insn_funct7, insn_rs2, insn_rs1, insn_funct3, insn_rd, insn_opcode} = p_insn;
 
 	// setup for I, S, B & J type instructions
 	// I - short immediates and loads
 	wire [11:0] imm_i;
-	assign imm_i = pipe_insn[31:20];
+	assign imm_i = p_insn[31:20];
 
 	// S - stores
 	wire [11:0] imm_s;
@@ -116,7 +123,7 @@ module nerv #(
 
 	// J - unconditional jumps
 	wire [20:0] imm_j;
-	assign {imm_j[20], imm_j[10:1], imm_j[11], imm_j[19:12], imm_j[0]} = {insn[31:12], 1'b0};
+	assign {imm_j[20], imm_j[10:1], imm_j[11], imm_j[19:12], imm_j[0]} = {p_insn[31:12], 1'b0};
 
 	wire [31:0] imm_i_sext = $signed(imm_i);
 	wire [31:0] imm_s_sext = $signed(imm_s);
@@ -159,6 +166,8 @@ module nerv #(
 	localparam OPCODE_CUSTOM_2   = 7'b 10_110_11;
 	localparam OPCODE_CUSTOM_3   = 7'b 11_110_11;
 
+	localparam NOP ={25'b 000000000000_00000_000_00000,OPCODE_OP_IMM};
+
 	// next write, next destination (rd), illegal instruction registers
 	logic next_wr;
 	logic [31:0] next_rd;
@@ -177,6 +186,9 @@ module nerv #(
 		next_rd = 0;
 		illinsn = 0;
 
+		detect_branch = 0;
+		branch_taken = 0;
+
 		mem_wr_enable = 0;
 		mem_wr_addr = 'hx;
 		mem_wr_data = 'hx;
@@ -192,18 +204,18 @@ module nerv #(
 			// Load Upper Immediate
 			OPCODE_LUI: begin
 				next_wr = 1;
-				next_rd = pipe_insn[31:12] << 12;
+				next_rd =  p_insn[31:12] << 12;
 			end
 			// Add Upper Immediate to Program Counter
 			OPCODE_AUIPC: begin
 				next_wr = 1;
-				next_rd = (pipe_insn[31:12] << 12) + pipe_pc;
+				next_rd = (p_insn[31:12] << 12) + pc;
 			end
 			// Jump And Link (unconditional jump)
 			OPCODE_JAL: begin
 				next_wr = 1;
-				next_rd = pipe_pc;
-				npc = pc + imm_j_sext;
+				next_rd = npc;
+				npc = p_pc + imm_j_sext;
 				if (npc & 32'b 11) begin
 					illinsn = 1;
 					npc = npc & ~32'b 11;
@@ -214,7 +226,7 @@ module nerv #(
 				case (insn_funct3)
 					3'b 000 /* JALR */: begin
 						next_wr = 1;
-						next_rd = pipe_pc;
+						next_rd = npc;
 						npc = (rs1_value + imm_i_sext) & ~32'b 1;
 					end
 					default: illinsn = 1;
@@ -226,13 +238,14 @@ module nerv #(
 			end
 			// branch instructions: Branch If Equal, Branch Not Equal, Branch Less Than, Branch Greater Than, Branch Less Than Unsigned, Branch Greater Than Unsigned
 			OPCODE_BRANCH: begin
+				detect_branch = 1;
 				case (insn_funct3)
 					3'b 000 /* BEQ  */: begin if (rs1_value == rs2_value) npc = pc + imm_b_sext; end
-					3'b 001 /* BNE  */: begin if (rs1_value != rs2_value) npc = pc + imm_b_sext; end
+					3'b 001 /* BNE  */: begin if (rs1_value != rs2_value) npc = pc + imm_b_sext;  end
 					3'b 100 /* BLT  */: begin if ($signed(rs1_value) < $signed(rs2_value)) npc = pc + imm_b_sext; end
-					3'b 101 /* BGE  */: begin if ($signed(rs1_value) >= $signed(rs2_value)) npc = pc + imm_b_sext; end
-					3'b 110 /* BLTU */: begin if (rs1_value < rs2_value) npc = pc + imm_b_sext; end
-					3'b 111 /* BGEU */: begin if (rs1_value >= rs2_value) npc = pc + imm_b_sext; end
+					3'b 101 /* BGE  */: begin if ($signed(rs1_value) >= $signed(rs2_value)) npc = pc + imm_b_sext;  end
+					3'b 110 /* BLTU */: begin if (rs1_value < rs2_value) npc = pc + imm_b_sext;  end
+					3'b 111 /* BGEU */: begin if (rs1_value >= rs2_value) npc = pc + imm_b_sext;  end
 					default: illinsn = 1;
 				endcase
 				if (npc & 32'b 11) begin
@@ -289,9 +302,9 @@ module nerv #(
 					10'b zzzzzzz_100 /* XORI  */: begin next_wr = 1; next_rd = rs1_value ^ imm_i_sext; end
 					10'b zzzzzzz_110 /* ORI   */: begin next_wr = 1; next_rd = rs1_value | imm_i_sext; end
 					10'b zzzzzzz_111 /* ANDI  */: begin next_wr = 1; next_rd = rs1_value & imm_i_sext; end
-					10'b 0000000_001 /* SLLI  */: begin next_wr = 1; next_rd = rs1_value << pipe_insn[24:20]; end
-					10'b 0000000_101 /* SRLI  */: begin next_wr = 1; next_rd = rs1_value >> pipe_insn[24:20]; end
-					10'b 0100000_101 /* SRAI  */: begin next_wr = 1; next_rd = $signed(rs1_value) >>> pipe_insn[24:20]; end
+					10'b 0000000_001 /* SLLI  */: begin next_wr = 1; next_rd = rs1_value <<  p_insn[24:20]; end
+					10'b 0000000_101 /* SRLI  */: begin next_wr = 1; next_rd = rs1_value >>  p_insn[24:20]; end
+					10'b 0100000_101 /* SRAI  */: begin next_wr = 1; next_rd = $signed(rs1_value) >>>  p_insn[24:20]; end
 					default: illinsn = 1;
 				endcase
 			end
@@ -347,7 +360,6 @@ module nerv #(
 			3'b 101 /* LHU */: begin mem_rdata = mem_rdata[15:0]; end
 		endcase
 	end
-localparam NOP ={25'b 000000000000_00000_000_00000,OPCODE_OP_IMM};
 
 	// every cycle
 	always @(posedge clock) begin
@@ -358,22 +370,21 @@ localparam NOP ={25'b 000000000000_00000_000_00000,OPCODE_OP_IMM};
 		if (!trapped && !reset && !reset_q) begin
 			if (illinsn)
 				trapped <= 1;
-			pc <= npc;
+
 			// update registers from memory or rd (destination)
 			if (mem_rd_enable_q || next_wr)
 				regfile[mem_rd_enable_q ? mem_rd_reg_q : insn_rd] <= mem_rd_enable_q ? mem_rdata : next_rd;
+            x10 <= regfile[10];
 		end
-        if (trapped)
-            $display("regfile[10]=%d", regfile[10]);
-        pipe_pc<=pc;
-        pipe_insn<=insn;
+
+		p_pc <= pc;
+		p_insn <= insn;
+
+
 		// reset
 		if (reset || reset_q) begin
 			pc <= RESET_ADDR - (reset ? 4 : 0);
 			trapped <= 0;
-			pipe_pc<=pc;
-			pipe_insn<=NOP;
 		end
 	end
-
 endmodule
